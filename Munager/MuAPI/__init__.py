@@ -1,43 +1,13 @@
 import json
 import logging
 from urllib.parse import urljoin, urlencode
-
+from Munager.User import SS_user,Vmess_user
 from tornado import gen
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest,HTTPClient
 import requests
 
 class MuAPIError(Exception):
     pass
-
-
-class User:
-    def __init__(self, **entries):
-        # for IDE hint
-        self.id = None
-        self.user_name = None
-        self.passwd = None
-        self.port = None
-        self.method = None
-        self.enable = None
-        self.u = None
-        self.d = None
-        self.transfer_enable = None
-
-        self.plugin = ""
-        self.plugin_opts = ""
-        self.__dict__.update(entries)
-        if "simple_obfs_http" in self.obfs:
-            self.plugin = "obfs-server"
-            self.plugin_opts = "obfs=http"
-
-        elif "simple_obfs_tls" in self.obfs:
-            self.plugin = "obfs-server"
-            self.plugin_opts = "obfs=tls"
-
-    @property
-    def available(self):
-        return True if self.disconnect_ip == None else False
-
 
 class MuAPI:
     def __init__(self, config):
@@ -46,8 +16,8 @@ class MuAPI:
         self.url_base = self.config.get('sspanel_url')
         self.key = self.config.get('key')
         self.node_id = self.config.get('node_id')
-        self.delay_sample = self.config.get('delay_sample')
         self.client = AsyncHTTPClient()
+        self.node_info = None
 
     def _get_request(self, path, query=dict(), method='GET', formdata=None,headers ={'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',}):
         query.update(key=self.key)
@@ -85,7 +55,27 @@ class MuAPI:
             return False
 
     @gen.coroutine
-    def get_users(self, key) -> dict:
+    def get_users(self,key,node_info) -> dict:
+        sort = node_info['sort']
+        if sort==0:
+            current_user = SS_user
+            prifix = "SS_"
+        else:
+            current_user = Vmess_user
+            prifix = "Vmess_"
+            if node_info['server']['protocol']=="tcp":
+                prifix+='tcp_'
+            elif node_info['server']['protocol'] == 'ws':
+                if node_info['server']['protocol_param']:
+                    prifix+='ws_'+node_info['server']['protocol_param']+"_"
+                else:
+                    prifix += 'ws_' + "none" + "_"
+            elif node_info['server']['protocol']=='kcp':
+                if node_info['server']['protocol_param']:
+                    prifix+='kcp_'+node_info['server']['protocol_param']+"_"
+                else:
+                    prifix += 'kcp_' + "none" + "_"
+
         request = self._get_request('/mod_mu/users',{"node_id":self.node_id})
         response = yield self.client.fetch(request)
         content = response.body.decode('utf-8')
@@ -94,7 +84,12 @@ class MuAPI:
             raise MuAPIError(cont_json)
         ret = dict()
         for user in cont_json.get('data'):
-            ret[user.get(key)] = User(**user)
+            user['prefixed_id'] = prifix+user.get(key)
+            user["user_id"] = user['id']
+            user['id'] = user['uuid']
+            ret[user['prefixed_id']] = current_user(**user)
+            if 'Vmess' in prifix:
+                ret[user['prefixed_id']].set_alterId(int(self.node_info['server'].get('AlterId',16)))
         return ret
 
     @gen.coroutine
@@ -110,15 +105,15 @@ class MuAPI:
         return result
 
     @gen.coroutine
-    def upload_throughput(self, user_id, traffic):
+    def upload_throughput(self, user_id, upload,donwload):
         request = self._get_request(
             path='/mu/users/{id}/traffic'.format(id=user_id),
             method='POST',
             query={
                 'node_id': self.node_id},
             formdata={
-                'u': 0,
-                'd': traffic,
+                'u': upload,
+                'd': donwload,
                 'node_id': self.node_id
             }
         )
@@ -159,6 +154,22 @@ class MuAPI:
 
     def get_node_info(self):
         url = self.url_base+"/mod_mu/nodes/{}/info".format(self.node_id)
-        print(url)
         r = requests.get(url, params={"key": self.key})
-        return json.loads(r.text)['data']
+        data = json.loads(r.text)['data']
+        temp_server = data['server'].split(";")
+        server = dict(zip(["server_address", 'port', 'AlterId', 'protocol', 'protocol_param'], temp_server[:5]))
+        if "protocol" in server:
+            if server['protocol'] == "tls":
+                server['protocol'],server['protocol_param'] = server['protocol_param'] ,server['protocol']
+        temp_extraArgs = []
+        if len(temp_server)==6:
+            temp_extraArgs = temp_server[5].split("|")
+        extraArgs = {}
+        for i in temp_extraArgs:
+            if i:
+                key, value = i.split("=")
+                extraArgs[key] = value
+        server['extraArgs'] = extraArgs
+        data['server'] = server
+        self.node_info = data
+        return data

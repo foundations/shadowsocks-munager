@@ -1,13 +1,13 @@
 import logging
 
 from tornado import gen
-from tornado.httpclient import AsyncHTTPClient, HTTPError
+from tornado.httpclient import HTTPError
 from tornado.ioloop import IOLoop, PeriodicCallback
 
 from Munager.MuAPI import MuAPI
-from Munager.SSManager import SSManager
 from Munager.V2Manager import V2Manager
 from Munager.SpeedTestManager import speedtest_thread
+import json
 
 class Munager:
     def __init__(self, config):
@@ -19,22 +19,22 @@ class Munager:
         # mix
         self.ioloop = IOLoop.current()
         self.mu_api = MuAPI(self.config)
-        self.node_info = self.mu_api.get_node_info()
-        self.logger.info("Node infos: {}".format(self.node_info))
-        if self.node_info['sort']==0:
-            self.ss_manager = SSManager(self.config)
-        elif self.node_info['sort']==11:
-            self.v2_manager = V2Manager(self.config)
-        self.logger.info('Munager initializing.')
+        node_info = self.mu_api.get_node_info()
+        self.logger.info("Node infos: {}".format(node_info))
+
+        self.manager = V2Manager(self.config, next_node_info=node_info)
+
+        self.first_time_start = True
+
     @gen.coroutine
     def upload_serverload(self):
         # update online users count
         try:
             uptime = self._uptime()
             load = self._load()
-            result = yield self.mu_api.upload_systemload(uptime,load)
+            result = yield self.mu_api.upload_systemload(uptime, load)
             if result:
-                self.logger.info('upload_system load success. uptime {}, load {}'.format(uptime,load))
+                self.logger.info('upload_system load success. uptime {}, load {}'.format(uptime, load))
         except HTTPError:
             self.logger.warning('upload_system load failed')
 
@@ -48,74 +48,82 @@ class Munager:
                 self.logger.info('Successfully upload speet test result {}.'.format(speedtest_result))
         except HTTPError:
             self.logger.warning('failed to upload online user count.')
+
     @gen.coroutine
-    def update_ss_manager(self):
+    def update_manager(self):
+        new_node_info = self.mu_api.get_node_info()
+        self.logger.info("Old Node infos: {}".format(self.manager.next_node_info))
+        self.logger.info("New Node infos: {}".format(new_node_info))
+        if json.dumps(self.manager.next_node_info,sort_keys=True,indent=2) != json.dumps(new_node_info,sort_keys=True,indent=2)\
+                or self.first_time_start:
+            self.manager.next_node_info=new_node_info
+            self.manager.update_server()
+            self.first_time_start = False
         # get from MuAPI and ss-manager
-        users = yield self.mu_api.get_users('port')
-        state = self.ss_manager.state
+        users = yield self.mu_api.get_users('email', self.manager.next_node_info)
+        current_user = self.manager.get_users()
         self.logger.info('get MuAPI and ss-manager succeed, now begin to check ports.')
-        #self.logger.debug('get state from ss-manager: {}.'.format(state))
+        # self.logger.debug('get state from ss-manager: {}.'.format(state))
 
-        # remove port
-        for port in state:
-            if port not in users or not users.get(port).available:
-                self.ss_manager.remove(port)
-                self.logger.info('remove port: {}.'.format(port))
+        # remove user by prefixed_id
+        for prefixed_id in current_user:
+            if prefixed_id not in users or not users.get(prefixed_id).available:
+                self.manager.remove(prefixed_id)
+                self.logger.info('need to remove client: {}.'.format(prefixed_id))
 
-        # add port
-        for port, user in users.items():
-            user_id = user.id
-            if user.available and port not in state:
-                if self.ss_manager.add(
-                        user_id=user_id,
-                        port=user.port,
-                        password=user.passwd,
-                        method=user.method,
-                        plugin=user.plugin,
-                        plugin_opts=user.plugin_opts,
-                ):
-                    self.logger.info('add user at port: {}.'.format(user.port))
+        # add prefixed_id
+        for prefixed_id, user in users.items():
+            if user.available and prefixed_id not in current_user:
+                if self.manager.add(user):
+                    self.logger.info('need to add user email {}.'.format(prefixed_id))
 
-            if user.available and port in state:
-                if user.passwd != state.get(port).get('password') or \
-                                user.method != state.get(port).get('method') or \
-                                user.plugin != state.get(port).get('plugin') or \
-                                user.plugin_opts != state.get(port).get('plugin_opts'):
-                    if self.ss_manager.remove(user.port) and self.ss_manager.add(
-                            user_id=user_id,
-                            port=user.port,
-                            password=user.passwd,
-                            method=user.method,
-                            plugin=user.plugin,
-                            plugin_opts=user.plugin_opts,
-                    ):
-                        self.logger.info('reset port {} due to method or password changed.'.format(user.port))
+            if user.available and prefixed_id in current_user:
+                if user != current_user.get(prefixed_id):
+                    if self.manager.remove(prefixed_id) and self.manager.add(user):
+                        self.logger.info('need to reset user {} due to method or password changed.'.format(prefixed_id))
+
         # check finish
         self.logger.info('check ports finished.')
+        self.logger.info("if update {}".format(self.manager.if_user_change))
+        if self.manager.if_user_change:
+            self.manager.if_user_change = False
+            self.manager.update_users()
+            self.manager.current_node_info = self.manager.next_node_info
 
     @gen.coroutine
-    def upload_ss_throughput(self):
-        state = self.ss_manager.state
+    def upload_throughput(self):
+        current_user = self.manager.get_users()
         online_amount = 0
-        for port, info in state.items():
-            cursor = info.get('cursor')
-            throughput = info.get('throughput')
-            if throughput < cursor:
+        for prefixed, user in current_user.items():
+            laset_traffic_upload,laset_traffic_download,user_id= self.manager.get_last_traffic(user)
+            current_upload,current_download = self.manager.client.get_user_traffic_uplink(user.email),\
+                                            self.manager.client.get_user_traffic_downlink(user.email)
+            if current_download is None:
+                current_download = 0
+            else:
+                current_download = int(current_download)
+            if current_upload is None:
+                current_upload = 0
+            else:
+                current_upload = int(current_upload)
+
+            if current_download+current_upload < laset_traffic_upload+laset_traffic_download:
                 online_amount += 1
                 self.logger.warning('error throughput, try fix.')
-                self.ss_manager.set_cursor(port, throughput)
-            elif throughput > cursor:
+                self.manager.set_current_traffic(user, upload=current_upload,download=current_download)
+            elif current_download+current_upload > laset_traffic_upload+laset_traffic_download:
                 online_amount += 1
-                dif = throughput - cursor
-                user_id = info.get('user_id')
+                upload_dif = current_upload - laset_traffic_upload
+                download_dif = current_download - laset_traffic_download
                 try:
-                    result = yield self.mu_api.upload_throughput(user_id, dif)
+                    result = yield self.mu_api.upload_throughput(user_id, upload=upload_dif,donwload=download_dif)
                     if result:
-                        self.ss_manager.set_cursor(port, throughput)
-                        self.logger.info('update traffic: {} for port: {}.'.format(dif, port))
+                        self.manager.set_current_traffic(user=user,upload=current_upload,download=current_download)
+                        self.logger.info('update traffic: Upload {}, Download {} for user: {}.'.format(upload_dif,
+                                                                                                       download_dif,
+                                                                                                       user.prefixed_id))
                 except:
                     self.logger.info('update trafic faileds')
-
 
         # update online users count
         try:
@@ -140,98 +148,31 @@ class Munager:
         import os
         return os.popen(
             "cat /proc/loadavg | awk '{ print $1\" \"$2\" \"$3 }'").readlines()[0]
+
     def run(self):
         # period task
-        if self.node_info['sort']==0:
-            PeriodicCallback(
-                callback=self.update_ss_manager,
-                callback_time=self._second_to_msecond(self.config.get('update_port_period', 60)),
-                io_loop=self.ioloop,
-            ).start()
-            PeriodicCallback(
-                callback=self.upload_ss_throughput,
-                callback_time=self._second_to_msecond(self.config.get('upload_throughput_period', 360)),
-                io_loop=self.ioloop,
-            ).start()
+        PeriodicCallback(
+            callback=self.update_manager,
+            callback_time=self._second_to_msecond(self.config.get('update_port_period', 60)),
+        ).start()
+        PeriodicCallback(
+            callback=self.upload_throughput,
+            callback_time=self._second_to_msecond(self.config.get('upload_throughput_period', 360)),
+        ).start()
         PeriodicCallback(
             callback=self.upload_serverload,
-            callback_time=self._second_to_msecond(self.config.get("upload_serverload_period",60)),
-            io_loop = self.ioloop,
+            callback_time=self._second_to_msecond(self.config.get("upload_serverload_period", 60)),
         ).start()
-        PeriodicCallback(
-            callback_time=self._second_to_msecond(self.config.get("upload_speedtest_period",21600)),
-            callback=self.upload_speedtest,
-            io_loop=self.ioloop
-        ).start()
+        if self.config.get("speedtest",False):
+            PeriodicCallback(
+                callback_time=self._second_to_msecond(self.config.get("upload_speedtest_period",21600)),
+                callback=self.upload_speedtest,
+            ).start()
         try:
             # Init task
-            self.ioloop.run_sync(self.upload_serverload)
+            self.ioloop.run_sync(self.update_manager)
             self.ioloop.start()
         except KeyboardInterrupt:
             del self.mu_api
-            if self.node_info['sort']==0:
-                del self.ss_manager
-            elif self.node_info['sort']==11:
-                del self.v2_manager
+            del self.manager
             print('Bye~')
-
-class Munager_test:
-    def __init__(self, config):
-        self.config = config
-
-        # set logger
-        self.logger = logging.getLogger()
-
-        # mix
-        self.ioloop = IOLoop.current()
-        self.mu_api = MuAPI(self.config)
-        print(self.mu_api.get_node_info())
-        self.logger.info('Munager initializing.')
-
-    @gen.coroutine
-    def upload_serverload(self):
-        # update online users count
-        try:
-            uptime = self._uptime()
-            load = self._load()
-            result = yield self.mu_api.upload_systemload(uptime,load)
-            if result:
-                self.logger.info('upload_system load success. uptime {}, load {}'.format(uptime,load))
-        except HTTPError:
-            self.logger.warning('upload_system load failed')
-
-    @staticmethod
-    def _second_to_msecond(period):
-        # s to ms
-        return period * 1000
-
-    @staticmethod
-    def _uptime():
-        with open('/proc/uptime', 'r') as f:
-            return float(f.readline().split()[0])
-
-    @staticmethod
-    def _load():
-        import os
-        return os.popen(
-            "cat /proc/loadavg | awk '{ print $1\" \"$2\" \"$3 }'").readlines()[0]
-    def run(self):
-        # period task
-
-        PeriodicCallback(
-            callback=self.upload_serverload,
-            callback_time=self._second_to_msecond(self.config.get("upload_serverload_period",60)),
-            io_loop = self.ioloop,
-        ).start()
-
-        try:
-            # Init task
-            self.ioloop.run_sync(self.upload_serverload)
-            self.ioloop.start()
-        except KeyboardInterrupt:
-            del self.mu_api
-            print('Bye~')
-
-
-
-
